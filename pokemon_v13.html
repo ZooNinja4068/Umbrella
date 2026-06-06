@@ -1649,7 +1649,7 @@ function saveLocalVotes(){
 async function loadData(){
   loadLocalVotes();
   try{
-    const rows = await sbFetch('/rest/v1/submissions?select=*&order=created_at.desc');
+    const rows = await sbFetch('/rest/v1/submissions?select=*&status=eq.approved&order=created_at.desc');
     submissions = (rows||[]).map(dbRowToSub);
   }catch(e){
     console.warn('Could not load from Supabase, falling back to localStorage', e);
@@ -1739,6 +1739,7 @@ async function saveSubmission(sub){
     extra_credits_text: sub.extraCreditsText || null,
     image_url: imageUrl,
     votes: 0,
+    status: 'pending',
     trainer_name: sub.trainerName || null,
     regional_key: sub.regionalKey || null,
   };
@@ -1752,6 +1753,30 @@ async function saveSubmission(sub){
   // Update local copy with real image URL so gallery renders immediately
   const local = submissions.find(s=>s.id===sub.id);
   if(local) local.image = imageUrl;
+
+  // Trigger moderation email (non-blocking — don't fail submission if this errors)
+  try {
+    await fetch(SUPABASE_URL + '/functions/v1/mod-queue', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + SUPABASE_KEY,
+      },
+      body: JSON.stringify({
+        id:          sub.id,
+        artist:      sub.artist,
+        pokemon:     sub.pokemon ? sub.pokemon.name : (sub.trainerName || sub.category),
+        imageUrl:    imageUrl,
+        format:      sub.formatLabel,
+        contact:     sub.contact,
+        description: sub.description,
+        aiUsed:      sub.aiUsed,
+        aiTools:     sub.aiTools,
+      }),
+    });
+  } catch(e) {
+    console.warn('Moderation email failed (submission still saved):', e);
+  }
 }
 
 // ── Increment vote count on Supabase ─────────────────────────────────────────
@@ -2515,12 +2540,40 @@ function applyCrop(){
   const img=new Image();
   img.onload=()=>{
     ctx.drawImage(img,sx,sy,sw,sh,0,0,sw,sh);
-    artDataUrl=canvas.toDataURL('image/png');
+    artDataUrl = compressCanvas(canvas);
     document.getElementById('preview-img').src=artDataUrl;
     document.getElementById('ratio-warning').style.display='none';
     closeCropper();
   };
   img.src=_cropSrc;
+}
+
+// Compress a canvas to JPEG, resizing down if needed, targeting ~400 KB
+function compressCanvas(srcCanvas) {
+  const MAX_BYTES = 400 * 1024; // 400 KB
+  const MAX_DIM   = 1200;       // max width or height in px
+
+  // 1. Resize if either dimension exceeds MAX_DIM
+  let w = srcCanvas.width, h = srcCanvas.height;
+  if (w > MAX_DIM || h > MAX_DIM) {
+    const scale = MAX_DIM / Math.max(w, h);
+    w = Math.round(w * scale);
+    h = Math.round(h * scale);
+  }
+  const out = document.createElement('canvas');
+  out.width = w; out.height = h;
+  out.getContext('2d').drawImage(srcCanvas, 0, 0, w, h);
+
+  // 2. Binary-search JPEG quality to hit target size
+  let lo = 0.3, hi = 0.92, best = out.toDataURL('image/jpeg', 0.85);
+  for (let i = 0; i < 6; i++) {
+    const mid = (lo + hi) / 2;
+    const attempt = out.toDataURL('image/jpeg', mid);
+    const bytes = Math.round((attempt.length - 22) * 3 / 4);
+    if (bytes > MAX_BYTES) { hi = mid; }
+    else { lo = mid; best = attempt; }
+  }
+  return best;
 }
 
 function closeCropper(){
@@ -2675,8 +2728,8 @@ function submitCard(){
                      [...document.querySelectorAll('#submit-step-2 .btn-primary')].pop();
   if(_submitBtn){ _submitBtn.disabled=true; _submitBtn.textContent='Uploading…'; }
 
-  // Optimistically add to local array so UI doesn't feel slow
-  submissions.unshift(sub);
+  // Don't add to local submissions array — it stays pending until you approve it via email.
+  // The submitter sees the success banner but the card won't appear publicly until approved.
 
   function _resetSubmitForm(){
     clearPokemon();
@@ -2728,9 +2781,6 @@ function submitCard(){
     _resetSubmitForm();
   }).catch(err=>{
     console.error('Submission failed:', err);
-    // Roll back optimistic insert
-    const idx = submissions.findIndex(s=>s.id===sub.id);
-    if(idx>-1) submissions.splice(idx,1);
     alert('Sorry, there was a problem saving your submission.\n\n'+err.message+'\n\nPlease try again.');
     if(_submitBtn){ _submitBtn.disabled=false; _submitBtn.textContent='Submit'; }
   });
